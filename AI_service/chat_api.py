@@ -10,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException
 from google.genai import types
 from pydantic import BaseModel, Field
 
-from AI_service import ai_service, settings
+from AI_service import ai_service, database, settings
 from AI_service.context.business_context import KNOWLEDGE_BASE
 from AI_service.ai_service import MODEL, SYSTEM_PROMPT
 
@@ -27,8 +27,10 @@ vector_store = []
 _vector_store_signature = None
 
 
-def create_embedding(text, task_type):
-    return ai_service.create_embedding(text, task_type)
+def create_embedding(text, task_type, cache_user_id=None):
+    if cache_user_id is None:
+        return ai_service.create_embedding(text, task_type)
+    return ai_service.create_embedding(text, task_type, cache_user_id)
 
 
 def validate_embedding(embedding):
@@ -75,7 +77,7 @@ def _public_knowledge_signature():
     )
 
 
-def build_vector_store():
+def build_vector_store(cache_user_id=None):
     global _vector_store_signature
     indexed_items = []
     seen_ids = set()
@@ -104,9 +106,16 @@ def build_vector_store():
                 item_id
             )
             continue
-        embedding = validate_embedding(
+        raw_embedding = (
             create_embedding(content.strip(), "RETRIEVAL_DOCUMENT")
+            if cache_user_id is None
+            else create_embedding(
+                content.strip(),
+                "RETRIEVAL_DOCUMENT",
+                cache_user_id
+            )
         )
+        embedding = validate_embedding(raw_embedding)
         if dimensions is None:
             dimensions = len(embedding)
         elif len(embedding) != dimensions:
@@ -136,7 +145,8 @@ def build_vector_store():
 def search_knowledge(
     question,
     limit=None,
-    filters=None
+    filters=None,
+    cache_user_id=None
 ):
     if not isinstance(question, str) or not question.strip():
         raise ValueError("Search query must not be empty.")
@@ -161,13 +171,67 @@ def search_knowledge(
         not vector_store
         or _vector_store_signature != signature
     ):
-        build_vector_store()
+        build_vector_store(cache_user_id)
     if not vector_store:
         return []
 
-    query_embedding = validate_embedding(
+    cache_key = None
+    if (
+        cache_user_id is not None
+        and settings.RAG_RETRIEVAL_CACHE_TTL_SECONDS > 0
+    ):
+        cache_key = database.make_cache_key(
+            "business-knowledge-search-v1",
+            {
+                "question": question.strip(),
+                "limit": limit,
+                "filters": filters,
+                "knowledge": [
+                    (
+                        item["id"],
+                        item["title"],
+                        item["content"],
+                        item["source"]
+                    )
+                    for item in vector_store
+                ],
+                "embedding_model": settings.GEMINI_EMBEDDING_MODEL,
+                "minimum_score": MIN_RELEVANCE_SCORE
+            }
+        )
+        cached_results = database.get_cached_value(
+            cache_user_id,
+            "business-knowledge-search",
+            cache_key
+        )
+        if isinstance(cached_results, list) and all(
+            isinstance(item, dict) for item in cached_results
+        ):
+            logger.info(
+                "Business retrieval reused a user-scoped cache entry.",
+                extra={
+                    "event": "rag_cache_hit",
+                    "cache_type": "business-knowledge-search"
+                }
+            )
+            return cached_results
+        if cached_results is not None:
+            database.delete_cached_value(
+                cache_user_id,
+                "business-knowledge-search",
+                cache_key
+            )
+
+    raw_query_embedding = (
         create_embedding(question.strip(), "RETRIEVAL_QUERY")
+        if cache_user_id is None
+        else create_embedding(
+            question.strip(),
+            "RETRIEVAL_QUERY",
+            cache_user_id
+        )
     )
+    query_embedding = validate_embedding(raw_query_embedding)
     if len(query_embedding) != len(vector_store[0]["embedding"]):
         raise ValueError(
             "Query embedding dimensions do not match business knowledge."
@@ -190,7 +254,16 @@ def search_knowledge(
             })
 
     results.sort(key=lambda item: item["score"], reverse=True)
-    return results[:limit]
+    results = results[:limit]
+    if cache_key is not None:
+        database.set_cached_value(
+            cache_user_id,
+            "business-knowledge-search",
+            cache_key,
+            results,
+            settings.RAG_RETRIEVAL_CACHE_TTL_SECONDS
+        )
+    return results
 
 
 class ChatRequest(BaseModel):

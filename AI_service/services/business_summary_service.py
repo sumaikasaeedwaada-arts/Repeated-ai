@@ -220,7 +220,10 @@ def generate_business_summary(
         )
     }, ensure_ascii=False)
     try:
-        result = ai_service.generate_answer(prompt)
+        result = ai_service.generate_answer(
+            prompt,
+            cache_user_id=user_id
+        )
     except AIProviderError:
         raise
     except Exception as exc:

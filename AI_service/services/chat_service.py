@@ -1,6 +1,8 @@
 import json
 import logging
+import time
 import uuid
+from datetime import datetime
 
 from fastapi import HTTPException
 
@@ -21,6 +23,7 @@ from AI_service.errors import (
 from AI_service.schemas.chat import (
     MessageRequest,
     build_chat_prompt,
+    context_fields,
 )
 from AI_service.time_utils import utc_now
 
@@ -45,6 +48,23 @@ def build_retrieval_query(history: list[dict], message: str) -> str:
         + " | ".join(previous_questions)
         + "\nCurrent question: "
         + message
+    )
+
+
+def _request_fingerprint(message: str, request: MessageRequest) -> str:
+    identifier = (
+        request.customer_identifier.strip()
+        if request.customer_identifier
+        else None
+    )
+    return database.make_cache_key(
+        "chat-request-v1",
+        {
+            "message": message,
+            "customer_identifier": identifier,
+            "business_context": context_fields(request.business_context),
+            "task_context": context_fields(request.task_context)
+        }
     )
 
 
@@ -75,6 +95,7 @@ def send_message(
     if not message:
         raise InvalidChatMessageError("Message cannot be blank.")
 
+    request_fingerprint = _request_fingerprint(message, request)
     try:
         with database.connect() as connection:
             conversation = owned_conversation(
@@ -83,13 +104,33 @@ def send_message(
                 user["id"]
             )
             prior_messages = connection.execute(
-                "SELECT role, content FROM messages WHERE conversation_id = ? "
+                "SELECT role, content, request_fingerprint, created_at "
+                "FROM messages WHERE conversation_id = ? "
                 "ORDER BY id DESC LIMIT ?",
                 (conversation_id, settings.MAX_HISTORY_MESSAGES)
             ).fetchall()
+            history_rows = list(reversed(prior_messages))
+            if (
+                settings.AI_RESPONSE_CACHE_TTL_SECONDS > 0
+                and len(prior_messages) >= 2
+                and prior_messages[0]["role"] == "assistant"
+                and prior_messages[1]["role"] == "user"
+                and prior_messages[1]["request_fingerprint"]
+                == request_fingerprint
+            ):
+                try:
+                    prior_request_at = datetime.fromisoformat(
+                        prior_messages[1]["created_at"]
+                    ).timestamp()
+                except (TypeError, ValueError, OverflowError):
+                    prior_request_at = 0
+                if 0 <= time.time() - prior_request_at <= (
+                    settings.AI_RESPONSE_CACHE_TTL_SECONDS
+                ):
+                    history_rows = history_rows[:-2]
             history = [
                 {"role": row["role"], "content": row["content"]}
-                for row in reversed(prior_messages)
+                for row in history_rows
             ]
             retrieval_query = build_retrieval_query(history, message)
             retrieved = rag.search_chunks(
@@ -108,7 +149,10 @@ def send_message(
                 identifier
             )
             try:
-                retrieved_business = chat_api.search_knowledge(message)
+                retrieved_business = chat_api.search_knowledge(
+                    message,
+                    cache_user_id=user["id"]
+                )
             except Exception:
                 logger.warning(
                     "Prepared business context retrieval failed; "
@@ -171,8 +215,13 @@ def send_message(
                 "page": item["page_number"]
             })
 
+    prompt_title = (
+        message[:70]
+        if conversation["title"] == "New conversation"
+        else conversation["title"]
+    )
     prompt = build_chat_prompt(
-        conversation["title"],
+        prompt_title,
         history,
         retrieved_business,
         context_chunks,
@@ -184,7 +233,10 @@ def send_message(
     )
 
     try:
-        answer = ai_service.generate_answer(prompt).strip()
+        answer = ai_service.generate_answer(
+            prompt,
+            cache_user_id=user["id"]
+        ).strip()
         if not answer:
             raise ValueError("The model returned an empty response.")
     except AIProviderError:
@@ -202,9 +254,11 @@ def send_message(
             connection.execute("BEGIN IMMEDIATE")
             owned_conversation(connection, conversation_id, user["id"])
             connection.execute(
-                "INSERT INTO messages(conversation_id, role, content, citations_json, created_at) "
-                "VALUES (?, 'user', ?, '[]', ?)",
-                (conversation_id, message, now)
+                "INSERT INTO messages("
+                "conversation_id, role, content, citations_json, "
+                "request_fingerprint, created_at) "
+                "VALUES (?, 'user', ?, '[]', ?, ?)",
+                (conversation_id, message, request_fingerprint, now)
             )
             connection.execute(
                 "INSERT INTO messages(conversation_id, role, content, citations_json, created_at) "

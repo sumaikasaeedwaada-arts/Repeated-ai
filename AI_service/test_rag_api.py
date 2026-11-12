@@ -135,6 +135,66 @@ class RagApiTests(unittest.TestCase):
             "What is the answer?"
         )
 
+    def test_repeated_chat_turn_reuses_cached_answer_and_keeps_history(self):
+        with patch.object(
+            ai_model_service.client.models,
+            "generate_content",
+            return_value=SimpleNamespace(text="Cached answer.")
+        ) as generate:
+            first = self.client.post(
+                "/chat",
+                headers=self.headers,
+                json={"message": "What is the delivery status?"}
+            )
+            conversation_id = first.json()["conversation_id"]
+            repeated = self.client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                headers=self.headers,
+                json={"message": "What is the delivery status?"}
+            )
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(repeated.status_code, 200, repeated.text)
+        self.assertEqual(repeated.json()["response"], "Cached answer.")
+        self.assertEqual(generate.call_count, 1)
+        history = self.client.get(
+            f"/api/conversations/{conversation_id}/messages",
+            headers=self.headers
+        )
+        self.assertEqual(len(history.json()["messages"]), 4)
+
+    def test_chat_cache_does_not_reuse_answer_for_changed_business_context(self):
+        with patch.object(
+            ai_model_service.client.models,
+            "generate_content",
+            side_effect=[
+                SimpleNamespace(text="First answer."),
+                SimpleNamespace(text="Second answer.")
+            ]
+        ) as generate:
+            first = self.client.post(
+                "/chat",
+                headers=self.headers,
+                json={
+                    "message": "What is the current status?",
+                    "business_context": {"business_id": "business-one"}
+                }
+            )
+            conversation_id = first.json()["conversation_id"]
+            second = self.client.post(
+                f"/api/conversations/{conversation_id}/messages",
+                headers=self.headers,
+                json={
+                    "message": "What is the current status?",
+                    "business_context": {"business_id": "business-two"}
+                }
+            )
+
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(second.json()["response"], "Second answer.")
+        self.assertEqual(generate.call_count, 2)
+
     def test_chat_endpoint_validates_messages_and_requires_authentication(self):
         missing_message = self.client.post(
             "/chat",
@@ -322,6 +382,58 @@ class RagApiTests(unittest.TestCase):
         )
         self.assertEqual(len(history.json()["messages"]), 2)
         self.assertEqual(history.json()["messages"][1]["citations"][0]["index"], 1)
+
+    def test_rag_result_cache_reuses_search_and_invalidates_changed_chunks(self):
+        document_id = "cache-test-document"
+        with api.database.connect() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE email = ?",
+                ("owner@example.com",)
+            ).fetchone()["id"]
+            connection.execute(
+                """
+                INSERT INTO documents
+                    (id, user_id, filename, media_type, status, created_at)
+                VALUES (?, ?, 'cache-test.txt', 'text/plain', 'ready', ?)
+                """,
+                (document_id, user_id, "2026-01-01T00:00:00+00:00")
+            )
+            rag.add_embedding(
+                connection,
+                document_id,
+                0,
+                "Original chunk content.",
+                [1.0, 0.0]
+            )
+            with patch.object(
+                rag,
+                "create_embedding",
+                return_value=[1.0, 0.0]
+            ) as embed:
+                first = rag.search_chunks(
+                    connection,
+                    user_id,
+                    "matching question"
+                )
+                repeated = rag.search_chunks(
+                    connection,
+                    user_id,
+                    "matching question"
+                )
+                connection.execute(
+                    "UPDATE chunks SET content = ? WHERE document_id = ?",
+                    ("Updated chunk content.", document_id)
+                )
+                updated = rag.search_chunks(
+                    connection,
+                    user_id,
+                    "matching question"
+                )
+
+        self.assertEqual(first[0]["content"], "Original chunk content.")
+        self.assertEqual(repeated, first)
+        self.assertEqual(updated[0]["content"], "Updated chunk content.")
+        self.assertEqual(embed.call_count, 2)
 
     def test_follow_up_retrieval_uses_prior_user_question_as_context(self):
         searches = []
@@ -533,7 +645,7 @@ class RagApiTests(unittest.TestCase):
         self.assertEqual(response.json()["citations"], [])
 
     def test_prepared_business_retrieval_reaches_rag_prompt_end_to_end(self):
-        def embedding(text, task_type):
+        def embedding(text, task_type, cache_user_id=None):
             if task_type == "RETRIEVAL_QUERY" or text.startswith("HisabDo is"):
                 return [1.0, 0.0]
             return [0.0, 1.0]

@@ -52,7 +52,8 @@ def _retrieve_context(user_id: int, request: CommunicationRequest):
     try:
         business_items = chat_api.search_knowledge(
             query or "business communication",
-            limit=settings.BUSINESS_KNOWLEDGE_TOP_K
+            limit=settings.BUSINESS_KNOWLEDGE_TOP_K,
+            cache_user_id=user_id
         )
     except Exception:
         logger.warning(
@@ -178,7 +179,10 @@ def generate_communication(
     business_context, customer_records = _retrieve_context(user_id, request)
     prompt = _build_prompt(request, business_context, customer_records)
     try:
-        response = ai_service.generate_answer(prompt)
+        response = ai_service.generate_answer(
+            prompt,
+            cache_user_id=user_id
+        )
     except AIProviderError:
         raise
     except Exception as exc:

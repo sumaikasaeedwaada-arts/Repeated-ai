@@ -52,12 +52,13 @@ FastAPI ── auth + validation + SQLite-backed rate limits
 |---|---|
 | `users` | `id`, unique case-insensitive `email`, PBKDF2 `password_hash`, `created_at` |
 | `conversations` | `id`, `user_id → users.id`, `title`, `created_at`, `updated_at` |
-| `messages` | `id`, `conversation_id → conversations.id`, `role`, `content`, `citations_json`, `created_at` |
+| `messages` | `id`, `conversation_id → conversations.id`, `role`, `content`, `citations_json`, optional repeat-request fingerprint, `created_at` |
 | `documents` | `id`, `user_id → users.id`, `filename`, `media_type`, `status`, `created_at` |
 | `notifications` | `id`, `user_id → users.id`, title/message/type, optional related entity, `is_read`, `created_at`, optional unique event key |
 | `chunks` | Stable `(document_id, chunk_index)` record key, `page_number`, `content`, `embedding_json` |
 | `vector_index_state` | Embedding model, established vector dimension, cosine similarity metric |
 | `rate_limit_buckets` | Shared SQLite fixed-window request counters keyed by client and route class |
+| `ai_cache_entries` | User-scoped response, embedding, and retrieval values with expiry and in-flight request leases |
 
 SQLite provides durable storage and exact cosine vector search for a single-node
 or modest dataset deployment. Each chunk upsert stores its text, embedding, and
@@ -115,6 +116,15 @@ availability failures return a sanitized HTTP 503 message. These responses do
 not include generated content or provider exception details. Rate limits share
 the configured SQLite database across workers; IP-based limits require trusted
 proxy configuration when the service is deployed behind a reverse proxy.
+
+The SQLite AI cache is scoped to the authenticated user and shared across
+workers. Identical Gemini prompts are cached for 300 seconds by default,
+embeddings for 24 hours, and user-document/business retrieval results for 60
+seconds. Cache keys include model/task and the effective prompt or retrieval
+corpus; changed document content, context, or model configuration produces a
+different key. Identical in-flight provider requests are coordinated through
+short SQLite leases. Set any cache TTL to `0` to disable that cache. Cached
+responses are never shared between accounts.
 
 Notifications are stored persistently in SQLite, are scoped to their recipient,
 and are returned newest-first. A successful document upload creates a
@@ -221,8 +231,9 @@ document-vector dimensions. Retrieval returns the source, stable entry ID,
 metadata, and cosine score and passes them into the existing grounded chat
 prompt. `BUSINESS_KNOWLEDGE_TOP_K` (default `3`) and
 `BUSINESS_KNOWLEDGE_MIN_RELEVANCE_SCORE` (default `0.35`) configure the result
-count and relevance cutoff. This curated knowledge base and its embeddings are
-in memory and do not persist across restarts. See
+count and relevance cutoff. Public knowledge embeddings remain in memory; the
+user-scoped SQLite cache also avoids repeat embedding and retrieval requests
+across restarts without sharing cached results between accounts. See
 [RETRIEVAL_PIPELINE_REPORT.md](./RETRIEVAL_PIPELINE_REPORT.md) for the workflow,
 tests, and limitations. Do not publish confidential business data.
 

@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import logging
@@ -8,7 +9,7 @@ from pathlib import PurePath
 
 import numpy as np
 
-from AI_service import ai_service, settings
+from AI_service import ai_service, database, settings
 
 
 logger = logging.getLogger(__name__)
@@ -90,10 +91,16 @@ def chunk_pages(
     return chunks
 
 
-def create_embedding(text: str, task_type: str) -> list[float]:
+def create_embedding(
+    text: str,
+    task_type: str,
+    cache_user_id: int | None = None
+) -> list[float]:
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Embedding text must not be empty.")
-    return ai_service.create_embedding(text, task_type)
+    if cache_user_id is None:
+        return ai_service.create_embedding(text, task_type)
+    return ai_service.create_embedding(text, task_type, cache_user_id)
 
 
 def validate_embedding(embedding) -> list[float]:
@@ -392,8 +399,51 @@ def search_chunks(
     if not query_rows:
         return []
 
-    query_embedding = create_embedding(query, "RETRIEVAL_QUERY")
-    query_embedding = validate_embedding(query_embedding)
+    cache_key = None
+    if settings.RAG_RETRIEVAL_CACHE_TTL_SECONDS > 0:
+        corpus_signature = [
+            (
+                row["id"],
+                row["document_id"],
+                hashlib.sha256(row["content"].encode("utf-8")).hexdigest(),
+                hashlib.sha256(
+                    row["embedding_json"].encode("utf-8")
+                ).hexdigest(),
+                row["filename"],
+                row["page_number"]
+            )
+            for row in sorted(query_rows, key=lambda item: item["id"])
+        ]
+        cache_key = database.make_cache_key(
+            "rag-search-v1",
+            {
+                "query": query,
+                "limit": limit,
+                "filters": filters or {},
+                "corpus": corpus_signature,
+                "embedding_model": settings.GEMINI_EMBEDDING_MODEL,
+                "minimum_score": settings.MIN_RELEVANCE_SCORE
+            }
+        )
+        cached_results = database.get_cached_value(
+            user_id,
+            "rag-search",
+            cache_key
+        )
+        if isinstance(cached_results, list) and all(
+            isinstance(item, dict) for item in cached_results
+        ):
+            logger.info(
+                "Document retrieval reused a user-scoped cache entry.",
+                extra={"event": "rag_cache_hit", "cache_type": "rag-search"}
+            )
+            return cached_results
+        if cached_results is not None:
+            database.delete_cached_value(user_id, "rag-search", cache_key)
+
+    query_embedding = validate_embedding(
+        create_embedding(query, "RETRIEVAL_QUERY", user_id)
+    )
     index_state = initialize_vector_index(connection)
     configured_dimensions = index_state["embedding_dimensions"]
     if (
@@ -460,4 +510,12 @@ def search_chunks(
             },
             "score": float(scores[int(index)])
         })
+    if cache_key is not None:
+        database.set_cached_value(
+            user_id,
+            "rag-search",
+            cache_key,
+            results,
+            settings.RAG_RETRIEVAL_CACHE_TTL_SECONDS
+        )
     return results

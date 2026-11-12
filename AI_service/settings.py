@@ -10,6 +10,15 @@ GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "30000"))
 AI_RATE_LIMIT_PER_MINUTE = int(
     os.getenv("AI_RATE_LIMIT_PER_MINUTE", "20")
 )
+AI_RESPONSE_CACHE_TTL_SECONDS = int(
+    os.getenv("AI_RESPONSE_CACHE_TTL_SECONDS", "300")
+)
+AI_EMBEDDING_CACHE_TTL_SECONDS = int(
+    os.getenv("AI_EMBEDDING_CACHE_TTL_SECONDS", "86400")
+)
+RAG_RETRIEVAL_CACHE_TTL_SECONDS = int(
+    os.getenv("RAG_RETRIEVAL_CACHE_TTL_SECONDS", "60")
+)
 GEMINI_EMBEDDING_MODEL = os.getenv(
     "GEMINI_EMBEDDING_MODEL",
     "gemini-embedding-001"
@@ -18,6 +27,12 @@ if GEMINI_TIMEOUT_MS <= 0:
     raise ValueError("GEMINI_TIMEOUT_MS must be a positive integer.")
 if AI_RATE_LIMIT_PER_MINUTE <= 0:
     raise ValueError("AI_RATE_LIMIT_PER_MINUTE must be a positive integer.")
+if min(
+    AI_RESPONSE_CACHE_TTL_SECONDS,
+    AI_EMBEDDING_CACHE_TTL_SECONDS,
+    RAG_RETRIEVAL_CACHE_TTL_SECONDS
+) < 0:
+    raise ValueError("AI cache TTL values must not be negative.")
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 MAX_UPLOAD_CHUNKS = 250
 MAX_CHUNK_CHARS = 1200

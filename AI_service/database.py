@@ -1,10 +1,18 @@
+import hashlib
 import json
+import logging
 import os
 import sqlite3
+import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 from AI_service import settings
+
+
+logger = logging.getLogger(__name__)
+MAX_AI_CACHE_ENTRIES = 10000
 
 
 SCHEMA = """
@@ -29,6 +37,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
     content TEXT NOT NULL,
     citations_json TEXT NOT NULL DEFAULT '[]',
+    request_fingerprint TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_conversation_created
@@ -82,6 +91,18 @@ CREATE TABLE IF NOT EXISTS rate_limit_buckets (
     window_started REAL NOT NULL,
     request_count INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ai_cache_entries (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    cache_type TEXT NOT NULL,
+    cache_key TEXT NOT NULL,
+    value_json TEXT,
+    expires_at REAL NOT NULL DEFAULT 0,
+    lease_token TEXT,
+    lease_until REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY(user_id, cache_type, cache_key)
+);
+CREATE INDEX IF NOT EXISTS ai_cache_entries_expiry
+    ON ai_cache_entries(expires_at);
 """
 
 
@@ -113,6 +134,14 @@ def connect():
 def initialize_database() -> None:
     with connect() as connection:
         connection.executescript(SCHEMA)
+        message_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(messages)")
+        }
+        if "request_fingerprint" not in message_columns:
+            connection.execute(
+                "ALTER TABLE messages ADD COLUMN request_fingerprint TEXT"
+            )
         connection.execute(
             """
             INSERT OR IGNORE INTO vector_index_state
@@ -120,6 +149,206 @@ def initialize_database() -> None:
             VALUES (1, ?, NULL, 'cosine')
             """,
             (settings.GEMINI_EMBEDDING_MODEL,)
+        )
+
+
+def make_cache_key(namespace: str, payload: object) -> str:
+    encoded = json.dumps(
+        [namespace, payload],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def get_cached_value(
+    user_id: int,
+    cache_type: str,
+    cache_key: str
+) -> object | None:
+    now = time.time()
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT value_json, expires_at
+            FROM ai_cache_entries
+            WHERE user_id = ? AND cache_type = ? AND cache_key = ?
+            """,
+            (user_id, cache_type, cache_key)
+        ).fetchone()
+        if row is None or row["value_json"] is None or row["expires_at"] <= now:
+            return None
+        try:
+            return json.loads(row["value_json"])
+        except json.JSONDecodeError:
+            logger.warning("Discarding malformed cached AI value.")
+            connection.execute(
+                """
+                DELETE FROM ai_cache_entries
+                WHERE user_id = ? AND cache_type = ? AND cache_key = ?
+                  AND lease_token IS NULL
+                """,
+                (user_id, cache_type, cache_key)
+            )
+            return None
+
+
+def claim_cache_entry(
+    user_id: int,
+    cache_type: str,
+    cache_key: str,
+    lease_seconds: float
+) -> str | None:
+    now = time.time()
+    lease_token = uuid.uuid4().hex
+    lease_until = now + lease_seconds
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        inserted = connection.execute(
+            """
+            INSERT OR IGNORE INTO ai_cache_entries
+                (user_id, cache_type, cache_key, lease_token, lease_until)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, cache_type, cache_key, lease_token, lease_until)
+        )
+        if inserted.rowcount:
+            return lease_token
+        updated = connection.execute(
+            """
+            UPDATE ai_cache_entries
+            SET value_json = NULL, expires_at = 0,
+                lease_token = ?, lease_until = ?
+            WHERE user_id = ? AND cache_type = ? AND cache_key = ?
+              AND expires_at <= ? AND lease_until <= ?
+            """,
+            (
+                lease_token,
+                lease_until,
+                user_id,
+                cache_type,
+                cache_key,
+                now,
+                now
+            )
+        )
+        return lease_token if updated.rowcount else None
+
+
+def store_claimed_value(
+    user_id: int,
+    cache_type: str,
+    cache_key: str,
+    lease_token: str,
+    value: object,
+    ttl_seconds: float
+) -> bool:
+    now = time.time()
+    encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    with connect() as connection:
+        stored = connection.execute(
+            """
+            UPDATE ai_cache_entries
+            SET value_json = ?, expires_at = ?, lease_token = NULL,
+                lease_until = 0
+            WHERE user_id = ? AND cache_type = ? AND cache_key = ?
+              AND lease_token = ?
+            """,
+            (
+                encoded,
+                now + ttl_seconds,
+                user_id,
+                cache_type,
+                cache_key,
+                lease_token
+            )
+        )
+        _prune_ai_cache(connection, now)
+        return stored.rowcount > 0
+
+
+def release_cache_claim(
+    user_id: int,
+    cache_type: str,
+    cache_key: str,
+    lease_token: str
+) -> None:
+    with connect() as connection:
+        connection.execute(
+            """
+            DELETE FROM ai_cache_entries
+            WHERE user_id = ? AND cache_type = ? AND cache_key = ?
+              AND lease_token = ?
+            """,
+            (user_id, cache_type, cache_key, lease_token)
+        )
+
+
+def delete_cached_value(
+    user_id: int,
+    cache_type: str,
+    cache_key: str
+) -> None:
+    with connect() as connection:
+        connection.execute(
+            """
+            DELETE FROM ai_cache_entries
+            WHERE user_id = ? AND cache_type = ? AND cache_key = ?
+              AND lease_token IS NULL
+            """,
+            (user_id, cache_type, cache_key)
+        )
+
+
+def set_cached_value(
+    user_id: int,
+    cache_type: str,
+    cache_key: str,
+    value: object,
+    ttl_seconds: float
+) -> None:
+    if ttl_seconds <= 0:
+        return
+    now = time.time()
+    encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+    with connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO ai_cache_entries
+                (user_id, cache_type, cache_key, value_json, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, cache_type, cache_key) DO UPDATE SET
+                value_json = excluded.value_json,
+                expires_at = excluded.expires_at,
+                lease_token = NULL,
+                lease_until = 0
+            """,
+            (user_id, cache_type, cache_key, encoded, now + ttl_seconds)
+        )
+        _prune_ai_cache(connection, now)
+
+
+def _prune_ai_cache(connection: sqlite3.Connection, now: float) -> None:
+    connection.execute(
+        "DELETE FROM ai_cache_entries WHERE expires_at <= ? AND lease_until <= ?",
+        (now, now)
+    )
+    excess = connection.execute(
+        "SELECT COUNT(*) - ? AS excess FROM ai_cache_entries",
+        (MAX_AI_CACHE_ENTRIES,)
+    ).fetchone()["excess"]
+    if excess > 0:
+        connection.execute(
+            """
+            DELETE FROM ai_cache_entries
+            WHERE rowid IN (
+                SELECT rowid FROM ai_cache_entries
+                ORDER BY expires_at ASC, rowid ASC LIMIT ?
+            )
+            """,
+            (excess,)
         )
 
 

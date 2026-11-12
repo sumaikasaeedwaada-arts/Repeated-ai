@@ -387,7 +387,7 @@ def _parse_opportunities(response: str, valid_evidence: dict[str, int]):
         raise InvalidCustomerInsightsError from exc
 
 
-def _generate_opportunities(issues, feedback):
+def _generate_opportunities(issues, feedback, user_id: int | None = None):
     evidence = {
         item.topic: item.distinct_document_count
         for item in issues + feedback
@@ -414,7 +414,10 @@ def _generate_opportunities(issues, feedback):
         )
     }, ensure_ascii=False)
     try:
-        response = ai_service.generate_answer(prompt)
+        response = ai_service.generate_answer(
+            prompt,
+            cache_user_id=user_id
+        )
     except AIProviderError:
         raise
     except Exception as exc:
@@ -439,7 +442,7 @@ def generate_customer_insights(
         request.customer_identifier,
         duplicate_document_count
     )
-    opportunities = _generate_opportunities(issues, feedback)
+    opportunities = _generate_opportunities(issues, feedback, user_id)
     return CustomerInsights(
         frequently_reported_issues=issues,
         interaction_patterns=interactions,

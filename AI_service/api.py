@@ -672,7 +672,11 @@ async def upload_document(
                 page,
                 text,
                 rag.validate_embedding(
-                    rag.create_embedding(text, "RETRIEVAL_DOCUMENT")
+                    rag.create_embedding(
+                        text,
+                        "RETRIEVAL_DOCUMENT",
+                        user["id"]
+                    )
                 )
             )
             for page, text in chunks
